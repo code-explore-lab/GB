@@ -1,10 +1,10 @@
-// Task 4：SIP UDP 服务器骨架。
+// Task 5：SIP 服务器 —— REGISTER + 401 Digest 鉴权。
 //
-// 现在只做两件事：
-//  1. 监听 UDP 5060
-//  2. 收到包 -> 解析 -> 打印
+// 收到的请求在这里分发：
 //
-// Task 5 会在这里加"收到 REGISTER 回 401"的逻辑。
+//	REGISTER -> 无 Authorization 回 401；带合法摘要回 200，并写入设备表
+//	MESSAGE  -> 先统一回 200（Task 6 再处理保活内容）
+//	其他     -> 405 Method Not Allowed
 package main
 
 import (
@@ -12,14 +12,32 @@ import (
 	"log"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
+	"GB/internal/registry"
 	"GB/internal/sip"
 )
 
-// 0.0.0.0 表示监听本机所有网卡。
-// 以后真实设备从局域网连进来，必须用 0.0.0.0，不能是 127.0.0.1。
-const listenAddr = "0.0.0.0:5060"
+const (
+	// 0.0.0.0 表示监听本机所有网卡。
+	// 以后真实设备从局域网连进来，必须用 0.0.0.0，不能是 127.0.0.1。
+	listenAddr = "0.0.0.0:5060"
+
+	// SIP 域，GB28181 里通常是平台 ID 的前 10 位。
+	realm = "3402000000"
+
+	// 学习用的默认密码；真实环境必须按设备配置。
+	defaultPassword = "12345678"
+)
+
+// 每个设备自己的密码。设备 ID -> 密码。
+// 查不到时退回 defaultPassword（方便你换 ID 做实验）。
+var passwords = map[string]string{
+	"34020000001320000001": "12345678",
+}
 
 func main() {
 	addr, err := net.ResolveUDPAddr("udp", listenAddr)
@@ -34,7 +52,10 @@ func main() {
 	}
 	defer conn.Close()
 
-	log.Printf("SIP server listening on udp %s", listenAddr)
+	devices := registry.New()
+	nonces := newNonceStore()
+
+	log.Printf("SIP server listening on udp %s (realm=%s)", listenAddr, realm)
 
 	buf := make([]byte, 64*1024) // SIP 报文一般很小，64KB 足够
 	for {
@@ -45,9 +66,162 @@ func main() {
 			continue // 单个包出错不要退出整个服务
 		}
 		msg := sip.Parse(string(buf[:n]))
+		if msg.Method == "" {
+			continue
+		}
 		printMessage(remote, msg)
+
+		resp := handle(remote, msg, devices, nonces)
+		if resp == "" {
+			continue
+		}
+		if _, err := conn.WriteToUDP([]byte(resp), remote); err != nil {
+			log.Printf("send to %s: %v", remote, err)
+			continue
+		}
+		log.Printf("-> %s  %s", remote, firstLine(resp))
 	}
 }
+
+// handle 根据方法分发请求，返回要发送的响应文本。
+func handle(remote *net.UDPAddr, m *sip.Message, devices *registry.Registry, nonces *nonceStore) string {
+	switch m.Method {
+	case "REGISTER":
+		return handleRegister(remote, m, devices, nonces)
+	case "MESSAGE":
+		// Task 5 先只应答，Task 6 会把保活 XML 解析出来刷新 LastSeen。
+		return sip.BuildResponse(m, 200, "Server: GB-Mini-SIP")
+	default:
+		return sip.BuildResponse(m, 405, "Allow: REGISTER, MESSAGE", "Server: GB-Mini-SIP")
+	}
+}
+
+func handleRegister(remote *net.UDPAddr, m *sip.Message, devices *registry.Registry, nonces *nonceStore) string {
+	deviceID := extractDeviceIDFromFrom(m.Get("from"))
+	if deviceID == "" {
+		return sip.BuildResponse(m, 400, "Server: GB-Mini-SIP")
+	}
+
+	authorization := m.Get("authorization")
+
+	// 第一轮：没有鉴权头，发挑战。
+	if authorization == "" {
+		log.Printf("REGISTER from %s: no Authorization, sending 401 challenge", deviceID)
+		return challenge(m, nonces)
+	}
+
+	// 第二轮：先确认 nonce 是我们发的、且没过期。
+	parsed := sip.ParseDigest(authorization)
+	if !nonces.valid(parsed["nonce"]) {
+		log.Printf("REGISTER from %s: unknown or expired nonce, re-challenging", deviceID)
+		return challenge(m, nonces)
+	}
+
+	// Authorization 里的 username/realm 必须和这次注册对得上。
+	// 只校验摘要是不够的：否则 A 设备可以拿 B 的用户名去注册成 A。
+	if parsed["username"] != deviceID || parsed["realm"] != realm {
+		log.Printf("REGISTER from %s: username/realm mismatch (username=%q realm=%q)",
+			deviceID, parsed["username"], parsed["realm"])
+		return sip.BuildResponse(m, 403, "Server: GB-Mini-SIP")
+	}
+
+	// 再用设备密码重算摘要并比对。
+	password, ok := passwords[deviceID]
+	if !ok {
+		log.Printf("device %s has no configured password, using default", deviceID)
+		password = defaultPassword
+	}
+	if !sip.VerifyDigest(authorization, "REGISTER", password) {
+		log.Printf("REGISTER from %s: digest verification FAILED", deviceID)
+		return sip.BuildResponse(m, 403, "Server: GB-Mini-SIP")
+	}
+
+	// 校验通过：写入设备表。
+	expires := parseExpires(m.Get("expires"))
+	now := time.Now()
+	devices.Upsert(registry.Device{
+		ID:        deviceID,
+		Addr:      remote,
+		ExpiresAt: now.Add(expires),
+		LastSeen:  now,
+		Online:    true,
+	})
+	log.Printf("device registered: %s  addr=%s  expires_in=%s", deviceID, remote, expires)
+	dumpRegistry(devices)
+
+	return sip.BuildResponse(m, 200,
+		"Contact: "+m.Get("contact"),
+		fmt.Sprintf("Expires: %d", int(expires.Seconds())),
+		"Server: GB-Mini-SIP",
+	)
+}
+
+// challenge 生成 401 + WWW-Authenticate。
+func challenge(m *sip.Message, nonces *nonceStore) string {
+	nonce := nonces.issue()
+	return sip.BuildResponse(m, 401,
+		fmt.Sprintf(`WWW-Authenticate: Digest realm="%s", nonce="%s", algorithm=MD5`, realm, nonce),
+		"Server: GB-Mini-SIP",
+	)
+}
+
+func parseExpires(v string) time.Duration {
+	seconds, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || seconds <= 0 {
+		seconds = 3600
+	}
+	if seconds > 86400 {
+		seconds = 86400 // 上限一天，防止设备报一个巨大的值
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func dumpRegistry(devices *registry.Registry) {
+	log.Printf("registry (%d devices):", devices.Len())
+	for _, d := range devices.All() {
+		log.Printf("  %s  addr=%s  expires_at=%s  online=%v",
+			d.ID, d.Addr, d.ExpiresAt.Format("15:04:05"), d.Online)
+	}
+}
+
+func firstLine(s string) string {
+	line, _, _ := strings.Cut(s, "\r\n")
+	return line
+}
+
+// nonceStore 记住服务器发出去的 nonce，防止客户端自己编一个来通过校验。
+type nonceStore struct {
+	mu     sync.Mutex
+	issued map[string]time.Time // nonce -> 过期时间
+}
+
+func newNonceStore() *nonceStore {
+	return &nonceStore{issued: make(map[string]time.Time)}
+}
+
+func (s *nonceStore) issue() string {
+	nonce := sip.NewNonce()
+	s.mu.Lock()
+	s.issued[nonce] = time.Now().Add(5 * time.Minute)
+	s.mu.Unlock()
+	return nonce
+}
+
+func (s *nonceStore) valid(nonce string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	expiresAt, ok := s.issued[nonce]
+	if !ok {
+		return false
+	}
+	if time.Now().After(expiresAt) {
+		delete(s.issued, nonce)
+		return false
+	}
+	return true
+}
+
 func extractDeviceIDFromFrom(from string) string {
 	s := strings.TrimPrefix(from, "<sip:")
 	idx := strings.Index(s, "@")
@@ -56,6 +230,7 @@ func extractDeviceIDFromFrom(from string) string {
 	}
 	return s[:idx]
 }
+
 func printMessage(remote *net.UDPAddr, m *sip.Message) {
 	line := strings.Repeat("=", 70)
 	fmt.Println(line)
