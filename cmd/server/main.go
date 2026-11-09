@@ -8,6 +8,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -17,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"GB/internal/gb28181"
 	"GB/internal/registry"
 	"GB/internal/sip"
 )
@@ -39,7 +41,17 @@ var passwords = map[string]string{
 	"34020000001320000001": "12345678",
 }
 
+var (
+	// 超过这个时长没收到保活，就认为设备离线。
+	// GB28181 设备一般每 60 秒保活一次，所以 90 秒是常见的容错值。
+	offlineTimeout = flag.Duration("offline-timeout", 90*time.Second, "超过该时长没有保活则标记离线")
+	// 后台巡检间隔，越短越及时，但也没必要比超时还密。
+	scanInterval = flag.Duration("scan-interval", 5*time.Second, "后台巡检间隔")
+)
+
 func main() {
+	flag.Parse()
+
 	addr, err := net.ResolveUDPAddr("udp", listenAddr)
 	if err != nil {
 		log.Fatalf("resolve %s: %v", listenAddr, err)
@@ -55,7 +67,11 @@ func main() {
 	devices := registry.New()
 	nonces := newNonceStore()
 
+	// 后台巡检：和收包循环并行跑，不阻塞 SIP 响应。
+	go monitorOffline(devices, *scanInterval, *offlineTimeout)
+
 	log.Printf("SIP server listening on udp %s (realm=%s)", listenAddr, realm)
+	log.Printf("offline detection: timeout=%s scan_interval=%s", *offlineTimeout, *scanInterval)
 
 	buf := make([]byte, 64*1024) // SIP 报文一般很小，64KB 足够
 	for {
@@ -89,8 +105,7 @@ func handle(remote *net.UDPAddr, m *sip.Message, devices *registry.Registry, non
 	case "REGISTER":
 		return handleRegister(remote, m, devices, nonces)
 	case "MESSAGE":
-		// Task 5 先只应答，Task 6 会把保活 XML 解析出来刷新 LastSeen。
-		return sip.BuildResponse(m, 200, "Server: GB-Mini-SIP")
+		return handleMessage(remote, m, devices)
 	default:
 		return sip.BuildResponse(m, 405, "Allow: REGISTER, MESSAGE", "Server: GB-Mini-SIP")
 	}
@@ -154,6 +169,50 @@ func handleRegister(remote *net.UDPAddr, m *sip.Message, devices *registry.Regis
 		fmt.Sprintf("Expires: %d", int(expires.Seconds())),
 		"Server: GB-Mini-SIP",
 	)
+}
+
+// handleMessage 处理 MESSAGE：目前只关心 Keepalive。
+func handleMessage(remote *net.UDPAddr, m *sip.Message, devices *registry.Registry) string {
+	notify, err := gb28181.ParseNotify(m.Body)
+	if err != nil {
+		// 解析不了也回 200：SIP 层面确实收到了，
+		// 回错误会让设备不断重发，反而放大问题。
+		log.Printf("MESSAGE from %s: bad body: %v", remote, err)
+		return sip.BuildResponse(m, 200, "Server: GB-Mini-SIP")
+	}
+
+	if !strings.EqualFold(notify.CmdType, "Keepalive") {
+		log.Printf("MESSAGE CmdType=%s from %s not handled yet", notify.CmdType, remote)
+		return sip.BuildResponse(m, 200, "Server: GB-Mini-SIP")
+	}
+
+	id := notify.DeviceID
+	if id == "" {
+		id = extractDeviceIDFromFrom(m.Get("from"))
+	}
+
+	if devices.Touch(id, remote, time.Now()) {
+		log.Printf("keepalive: %s online (SN=%d status=%s)", id, notify.SN, notify.Status)
+	} else {
+		// 没注册过的设备也能发保活，忽略但不报错。
+		log.Printf("keepalive from unregistered device %s, ignored", id)
+	}
+
+	return sip.BuildResponse(m, 200, "Server: GB-Mini-SIP")
+}
+
+// monitorOffline 是后台巡检协程：
+// 每隔 interval 扫一次，把超过 timeout 没保活的设备标记离线。
+func monitorOffline(devices *registry.Registry, interval, timeout time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for now := range ticker.C {
+		for _, id := range devices.MarkStaleOffline(now, timeout) {
+			log.Printf("device OFFLINE: %s (no keepalive for > %s)", id, timeout)
+			dumpRegistry(devices)
+		}
+	}
 }
 
 // challenge 生成 401 + WWW-Authenticate。

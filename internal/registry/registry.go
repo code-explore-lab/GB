@@ -45,6 +45,45 @@ func (r *Registry) Get(id string) (Device, bool) {
 	return d, ok
 }
 
+// Touch 刷新设备的保活时间，并把它标记为在线。
+// 返回 false 表示这个设备没注册过（保活消息来自未知设备）。
+func (r *Registry) Touch(id string, addr *net.UDPAddr, now time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	d, ok := r.devices[id]
+	if !ok {
+		return false
+	}
+	d.LastSeen = now
+	d.Online = true
+	if addr != nil {
+		d.Addr = addr // 设备可能换了端口（NAT 重新映射），跟着更新
+	}
+	r.devices[id] = d
+	return true
+}
+
+// MarkStaleOffline 把所有"在线但超过 timeout 没有保活"的设备标记为离线，
+// 返回本次状态发生变化的设备 ID（按字母序，方便日志稳定）。
+//
+// 这个函数是幂等的：已经是离线的设备不会被重复返回。
+func (r *Registry) MarkStaleOffline(now time.Time, timeout time.Duration) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var offline []string
+	for id, d := range r.devices {
+		if d.Online && now.Sub(d.LastSeen) > timeout {
+			d.Online = false
+			r.devices[id] = d
+			offline = append(offline, id)
+		}
+	}
+	sort.Strings(offline)
+	return offline
+}
+
 // All 返回按 ID 排序的快照。
 // 返回副本，调用方遍历时不会阻塞写入。
 func (r *Registry) All() []Device {
