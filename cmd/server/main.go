@@ -48,11 +48,23 @@ func main() {
 		printMessage(remote, msg)
 	}
 }
-
+func extractDeviceIDFromFrom(from string) string {
+	s := strings.TrimPrefix(from, "<sip:")
+	idx := strings.Index(s, "@")
+	if idx == -1 {
+		return ""
+	}
+	return s[:idx]
+}
 func printMessage(remote *net.UDPAddr, m *sip.Message) {
 	line := strings.Repeat("=", 70)
 	fmt.Println(line)
 	// 起始行拆出来的三个关键字段
+	fromVal := m.Get("from")
+	devID := extractDeviceIDFromFrom(fromVal)
+	if devID != "" {
+		fmt.Printf("设备 %s 发来 %s\n", devID, m.Method)
+	}
 	fmt.Printf("<<< from %s\n", remote)
 	fmt.Printf("    method=%q uri=%q version=%q\n", m.Method, m.URI, m.Version)
 	fmt.Println(strings.Repeat("-", 70))
